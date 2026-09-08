@@ -125,6 +125,25 @@ static const Edge264MbFlags flags_twice = {
 	.CodedBlockPatternChromaAC = 1,
 	.coded_block_flags_16x16 = {1, 1, 1},
 };
+/**
+ * Macroblock state is split across two arrays, both indexed identically by
+ * mbx + mby * (pic_width_in_mbs + 1).
+ *
+ * Edge264Macroblock is RETAINED PER FRAME SLOT: it holds what outlives the
+ * picture - the motion field a later B slice reads through mbCol, plus the
+ * deblocking inputs the end-of-slice catch-up walk needs. Every decoded picture
+ * in the DPB keeps one of these.
+ *
+ * Edge264MbScratch is CURRENT-PICTURE ONLY: pure neighbour context for entropy
+ * decoding, never read once the picture is done. It is allocated per task
+ * rather than per frame slot, so a serial decoder keeps exactly one instead of
+ * one per DPB entry. At 1080p that is 1 MB rather than 6, which is what makes
+ * many concurrent decoders scale - the working set, not the decode speed, is
+ * what saturates a shared L3.
+ *
+ * Splitting them cost 128 of the original 304 bytes per macroblock. Keep the
+ * 16-byte alignment of every vector union if you reorder either struct.
+ */
 typedef struct {
 	int8_t error_probability; // 0..100, must be first for outside API
 	int8_t recovery_bits; // bit 0 is flipped for each new frame, bit 1 signals error
@@ -132,21 +151,25 @@ typedef struct {
 	int8_t filter_edges; // bits 0-1 enable deblocking of A/B edges, bit 2 signals that deblocking is pending
 	union { uint8_t QP[3]; i8x4 QP_s; }; // [iYCbCr]
 	union { uint32_t bits[2]; uint64_t bits_l; }; // {cbp/ref_idx_nz, cbf_Y/Cb/Cr 8x8}
-	union { int8_t Intra4x4PredMode[16]; int32_t Intra4x4PredMode_s[4]; i8x16 Intra4x4PredMode_v; }; // [i4x4]
-	union { int8_t nC[48]; int32_t nC_s[12]; int64_t nC_l[6]; i8x16 nC_v[3]; }; // for CAVLC and deblocking, 64 if unavailable
-	union { uint8_t absMvd[64]; uint64_t absMvd_l[8]; i8x16 absMvd_v[4]; }; // [LX][i4x4][compIdx]
 	// fields used by mbCol thus kept together for slice prefetching (do not reorder!)
 	Edge264MbFlags f;
 	union { int8_t refIdx[8]; int32_t refIdx_s[2]; int64_t refIdx_l; }; // [LX][i8x8]
 	union { int8_t refPic[8]; int32_t refPic_s[2]; int64_t refPic_l; }; // [LX][i8x8]
 	union { int16_t mvs[64]; int32_t mvs_s[32]; int64_t mvs_l[16]; i16x8 mvs_v[8]; }; // [LX][i4x4][compIdx]
 } Edge264Macroblock;
+typedef struct {
+	union { int8_t Intra4x4PredMode[16]; int32_t Intra4x4PredMode_s[4]; i8x16 Intra4x4PredMode_v; }; // [i4x4]
+	union { int8_t nC[48]; int32_t nC_s[12]; int64_t nC_l[6]; i8x16 nC_v[3]; }; // for CAVLC and deblocking, 64 if unavailable
+	union { uint8_t absMvd[64]; uint64_t absMvd_l[8]; i8x16 absMvd_v[4]; }; // [LX][i4x4][compIdx]
+} Edge264MbScratch;
 static Edge264Macroblock unavail_mb = {
 	.f.mb_skip_flag = 1,
 	.f.mb_type_I_NxN = 1,
 	.f.mb_type_B_Direct = 1,
 	.refIdx = {-1, -1, -1, -1, -1, -1, -1, -1},
 	.bits[0] = 0xac, // cbp
+};
+static Edge264MbScratch unavail_mbs = {
 	.Intra4x4PredMode = {-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2},
 };
 
@@ -235,6 +258,7 @@ typedef struct {
 	int8_t ChromaArrayType; // 0..3
 	int8_t direct_8x8_inference_flag; // 0..1
 	int8_t cabac_init_idc; // 0..3
+	int8_t mv_only; // 0..1, mirror of Edge264Decoder.mv_only, tested per macroblock
 	int8_t next_deblock_idc; // -1..31, -1 if next_deblock_addr is not written back to dec, currPic otherwise
 	int8_t frame_flip_bit; // 0..1
 	int16_t pic_width_in_mbs; // 0..1023
@@ -250,6 +274,7 @@ typedef struct {
 	Edge264UnrefCb unref_cb; // copy from decode_NAL
 	void *unref_arg; // copy from decode_NAL
 	Edge264Macroblock *mb_buffer;
+	Edge264MbScratch *mbs_buffer; // per task, NOT per frame slot - see the struct comment
 	Edge264Macroblock *mbCol_buffer;
 	uint8_t *samples_buffers[32];
 	union { uint16_t samples_clip[3][8]; i16x8 samples_clip_v[3]; }; // [iYCbCr], maximum sample value
@@ -281,6 +306,12 @@ typedef struct Edge264Context {
 	const Edge264Macroblock * _mbB; // backup storage for macro mbB
 	const Edge264Macroblock * _mbC; // backup storage for macro mbC
 	const Edge264Macroblock * _mbD; // backup storage for macro mbD
+	// scratch counterparts, walked in lockstep with the five above
+	Edge264MbScratch * _mbs;
+	const Edge264MbScratch * _mbsA;
+	const Edge264MbScratch * _mbsB;
+	const Edge264MbScratch * _mbsC;
+	const Edge264MbScratch * _mbsD;
 	const Edge264Macroblock *mbCol;
 	Edge264Decoder *d;
 	Edge264MbFlags inc; // increments for CABAC indices of macroblock syntax elements
@@ -337,6 +368,11 @@ typedef struct Edge264Context {
 #define mbB ctx->_mbB
 #define mbC ctx->_mbC
 #define mbD ctx->_mbD
+#define sc ctx->_mbs
+#define scA ctx->_mbsA
+#define scB ctx->_mbsB
+#define scC ctx->_mbsC
+#define scD ctx->_mbsD
 
 
 
@@ -389,6 +425,15 @@ typedef struct Edge264Decoder {
 	// minimal set of fields preserved across flushes
 	Edge264GetBits gb; // must be first in the struct to use the same pointer for bitstream functions
 	int8_t n_threads; // 0 to disable multithreading
+	// Motion-vector-only mode: parse everything, reconstruct nothing. Every
+	// syntax element is still decoded (the entropy decoder must stay in sync,
+	// and mvs/refIdx are what callers want), but motion compensation, intra
+	// prediction, residual application and deblocking are skipped - none of
+	// them feed back into mb_type, ref_idx, mvd or mv prediction. Decoded
+	// samples are meaningless in this mode. Deliberately placed above
+	// nal_ref_idc, i.e. inside the region clear_decoder() preserves, so a flush
+	// does not silently turn it back off.
+	int8_t mv_only;
 	int8_t max_output_latency; // number of frames in output_queue to suspend decoding of new frames, 0..16
 	int8_t nal_unit_type; // 5 significant bits
 	int32_t plane_size_Y;
@@ -401,6 +446,11 @@ typedef struct Edge264Decoder {
 	void *(*worker_loop)(void *);
 	uint8_t *samples_buffers[32];
 	Edge264Macroblock *mb_buffers[32];
+	// One scratch array per task (16 max), allocated lazily. A serial decoder
+	// only ever fills tasks[0], so it keeps exactly one - which is where the
+	// per-frame-slot memory saving comes from.
+	Edge264MbScratch *mbs_buffers[16];
+	int32_t mbs_buffer_mbs[16]; // macroblock count each was sized for, 0 = unallocated
 	Parser parse_nal_unit[32];
 	pthread_t threads[16];
 	pthread_mutex_t lock;

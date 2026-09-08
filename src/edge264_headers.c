@@ -182,11 +182,21 @@ static void initialize_context(Edge264Context *ctx, int currPic)
 	ctx->samples_mb[2] = ctx->samples_mb[1] + (ctx->t.stride[1] >> 1);
 	int mb_offset = ctx->mbx + ctx->mby * (ctx->t.pic_width_in_mbs + 1);
 	ctx->mbCol = ctx->_mb = ctx->t.mb_buffer + mb_offset;
+	ctx->_mbs = ctx->t.mbs_buffer + mb_offset;
 	ctx->A4x4_int8_v = (i16x16){0, 0, 2, 2, 1, 4, 3, 6, 8, 8, 10, 10, 9, 12, 11, 14};
 	ctx->B4x4_int8_v = (i32x16){0, 1, 0, 1, 4, 5, 4, 5, 2, 3, 8, 9, 6, 7, 12, 13};
 	if (ctx->t.ChromaArrayType == 1) {
 		ctx->ACbCr_int8_v[0] = (i16x8){0, 0, 2, 2, 4, 4, 6, 6};
 		ctx->BCbCr_int8_v[0] = (i32x8){0, 1, 0, 1, 4, 5, 4, 5};
+	} else if (ctx->t.ChromaArrayType == 2) {
+		// 4:2:2 has eight 4x4 blocks per component in a 2-wide, 4-tall grid
+		// (Cb at nC+16..23, Cr at nC+24..31) instead of 4:2:0's 2x2. Entries for
+		// blocks on the left/top macroblock edge are placeholders, overwritten
+		// with mbA/mbB offsets in parse_slice_data when those become available.
+		ctx->ACbCr_int8_v[0] = (i16x8){0, 0, 2, 2, 4, 4, 6, 6};
+		ctx->ACbCr_int8_v[1] = (i16x8){8, 8, 10, 10, 12, 12, 14, 14};
+		ctx->BCbCr_int8_v[0] = (i32x8){0, 1, 0, 1, 2, 3, 4, 5};
+		ctx->BCbCr_int8_v[1] = (i32x8){8, 9, 8, 9, 10, 11, 12, 13};
 	}
 	
 	ctx->QP_C_v[0] = loadu128(QP_Y2C + 12 + ctx->t.pps.chroma_qp_index_offset);
@@ -301,6 +311,7 @@ static void recover_slice(Edge264Context *ctx, int currPic) {
 	ctx->samples_mb[2] = ctx->samples_mb[1] + (ctx->t.stride[1] >> 1);
 	int mb_offset = ctx->mbx + ctx->mby * (ctx->t.pic_width_in_mbs + 1);
 	ctx->_mb = ctx->t.mb_buffer + mb_offset;
+	ctx->_mbs = ctx->t.mbs_buffer + mb_offset;
 	ctx->mbCol = ctx->t.mbCol_buffer + mb_offset;
 	unsigned num = ctx->CurrMbAddr - ctx->t.first_mb_in_slice;
 	unsigned div = 65536 - ppow(65194, num);
@@ -401,10 +412,10 @@ static void recover_slice(Edge264Context *ctx, int currPic) {
 			*(int64_t *)DADDR(cE,  1) = v7[1];
 		} else if (i > 0 && p128 >= 32) { // recover above 25% error (arbitrary)
 			if (ctx->t.slice_type == 0) { // P slice -> P_Skip
-				mb->nC_v[0] = (i8x16){};
+				sc->nC_v[0] = (i8x16){};
 				decode_P_skip(ctx);
 			} else { // B slice -> B_Skip
-				mb->nC_v[0] = (i8x16){};
+				sc->nC_v[0] = (i8x16){};
 				decode_direct_mv_pred(ctx, 0xffffffff);
 			}
 		}
@@ -498,7 +509,14 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 			c.t.unref_cb((int)ret, c.t.unref_arg);
 		
 		// deblock the rest of mbs in this slice
-		if (c.t.next_deblock_addr >= 0) {
+		if (c.t.next_deblock_addr >= 0 && c.t.mv_only) {
+			// mv_only: deblock_mb() is a no-op, so the walk below is pure
+			// pointer arithmetic around an empty noinline call. Advance the
+			// counter to exactly where the loop would have left it. Nothing
+			// after this reads mbx/mby/samples_mb/_mb - recover_slice()
+			// recomputes them from first_mb_in_slice.
+			c.t.next_deblock_addr = max(max(c.t.next_deblock_addr, c.t.first_mb_in_slice), (int)c.CurrMbAddr);
+		} else if (c.t.next_deblock_addr >= 0) {
 			c.t.next_deblock_addr = max(c.t.next_deblock_addr, c.t.first_mb_in_slice);
 			c.mby = (unsigned)c.t.next_deblock_addr / (unsigned)c.t.pic_width_in_mbs;
 			c.mbx = (unsigned)c.t.next_deblock_addr % (unsigned)c.t.pic_width_in_mbs;
@@ -506,16 +524,19 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 			c.samples_mb[1] = c.t.samples_buffers[currPic] + (c.mbx + c.mby * c.t.stride[1]) * 8 + c.t.plane_size_Y;
 			c.samples_mb[2] = c.samples_mb[1] + (c.t.stride[1] >> 1);
 			c._mb = (Edge264Macroblock *)c.t.mb_buffer + c.mbx + c.mby * (c.t.pic_width_in_mbs + 1);
+			c._mbs = c.t.mbs_buffer + c.mbx + c.mby * (c.t.pic_width_in_mbs + 1);
 			while (c.t.next_deblock_addr < c.CurrMbAddr) {
 				deblock_mb(&c);
 				c.t.next_deblock_addr++;
 				c._mb++;
+				c._mbs++;
 				c.mbx++;
 				c.samples_mb[0] += 16;
 				c.samples_mb[1] += 8;
 				c.samples_mb[2] += 8;
 				if (c.mbx >= c.t.pic_width_in_mbs) {
 					c._mb++;
+					c._mbs++;
 					c.mbx = 0;
 					c.samples_mb[0] += c.t.stride[0] * 16 - c.t.pic_width_in_mbs * 16;
 					c.samples_mb[1] += c.t.stride[1] * 8 - c.t.pic_width_in_mbs * 8;
@@ -535,28 +556,47 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 			pthread_cond_broadcast(&c.d->task_progress);
 		}
 		
-		// deblock the rest of the frame if all mbs have been decoded correctly
-		int remaining_mbs = ret ?: __atomic_sub_fetch(&c.d->remaining_mbs[currPic], c.CurrMbAddr - c.t.first_mb_in_slice, __ATOMIC_ACQ_REL);
+		// deblock the rest of the frame if all mbs have been decoded correctly.
+		// `ret ?:` short-circuits the counter because a slice that failed
+		// mid-way did not decode CurrMbAddr - first_mb_in_slice macroblocks, so
+		// subtracting that would corrupt the count. But a slice can also fail
+		// *after* walking the whole picture - the CABAC trailing-bits check
+		// below parse_slice_data_cabac() rejects streams that leave stray bits
+		// past the last macroblock, which some encoders emit. That picture is
+		// complete in every sense that matters: skipping the completion path
+		// leaves next_deblock_addr short of INT_MAX forever, so the frame is
+		// never output and any later slice referencing it can never become
+		// ready - which in serial mode reaches worker_loop with no ready task
+		// and trips its assert. Let a slice that reached the end of the picture
+		// through to the counter regardless of ret.
+		int decoded_whole_picture = c.CurrMbAddr >= c.t.pic_width_in_mbs * c.t.pic_height_in_mbs;
+		int remaining_mbs = (ret && !decoded_whole_picture) ? ret :
+			__atomic_sub_fetch(&c.d->remaining_mbs[currPic], c.CurrMbAddr - c.t.first_mb_in_slice, __ATOMIC_ACQ_REL);
 		if (remaining_mbs == 0) {
 			c.t.next_deblock_addr = c.d->next_deblock_addr[currPic];
 			c.CurrMbAddr = c.t.pic_width_in_mbs * c.t.pic_height_in_mbs;
-			if ((unsigned)c.t.next_deblock_addr < c.CurrMbAddr) {
+			// mv_only: same as above, and here even the counter is dead - the
+			// line after this loop overwrites it with INT_MAX.
+			if (!c.t.mv_only && (unsigned)c.t.next_deblock_addr < c.CurrMbAddr) {
 				c.mby = (unsigned)c.t.next_deblock_addr / (unsigned)c.t.pic_width_in_mbs;
 				c.mbx = (unsigned)c.t.next_deblock_addr % (unsigned)c.t.pic_width_in_mbs;
 				c.samples_mb[0] = c.t.samples_buffers[currPic] + (c.mbx + c.mby * c.t.stride[0]) * 16;
 				c.samples_mb[1] = c.t.samples_buffers[currPic] + (c.mbx + c.mby * c.t.stride[1]) * 8 + c.t.plane_size_Y;
 				c.samples_mb[2] = c.samples_mb[1] + (c.t.stride[1] >> 1);
 				c._mb = (Edge264Macroblock *)c.t.mb_buffer + c.mbx + c.mby * (c.t.pic_width_in_mbs + 1);
+				c._mbs = c.t.mbs_buffer + c.mbx + c.mby * (c.t.pic_width_in_mbs + 1);
 				while (c.t.next_deblock_addr < c.CurrMbAddr) {
 					deblock_mb(&c);
 					c.t.next_deblock_addr++;
 					c._mb++;
+					c._mbs++;
 					c.mbx++;
 					c.samples_mb[0] += 16;
 					c.samples_mb[1] += 8;
 					c.samples_mb[2] += 8;
 					if (c.mbx >= c.t.pic_width_in_mbs) {
 						c._mb++;
+						c._mbs++;
 						c.mbx = 0;
 						c.samples_mb[0] += c.t.stride[0] * 16 - c.t.pic_width_in_mbs * 16;
 						c.samples_mb[1] += c.t.stride[1] * 8 - c.t.pic_width_in_mbs * 8;
@@ -897,6 +937,7 @@ static void initialize_task(Edge264Decoder *dec, Edge264SeqParameterSet *sps, Ed
 	// copy most essential fields from dec
 	memcpy(&t->gb, &dec->gb, sizeof(dec->gb)); // GCC-14 crashes on dec->out = format
 	t->ChromaArrayType = sps->ChromaArrayType;
+	t->mv_only = dec->mv_only;
 	t->direct_8x8_inference_flag = sps->direct_8x8_inference_flag;
 	t->pic_width_in_mbs = sps->pic_width_in_mbs;
 	t->pic_height_in_mbs = sps->pic_height_in_mbs;
@@ -925,6 +966,24 @@ static void initialize_task(Edge264Decoder *dec, Edge264SeqParameterSet *sps, Ed
 		t->disable_deblocking_filter_idc == 2) ? t->first_mb_in_slice : INT_MIN;
 	t->prev_long_term_frames = dec->prev_long_term_frames & ~dec->prev_short_term_frames; // mask of only long-term frames
 	t->mb_buffer = (Edge264Macroblock *)dec->mb_buffers[dec->currPic];
+	// Scratch is per task, sized like the frame's macroblock array and reused
+	// across pictures. Reallocated only when the frame format changes.
+	{
+		int task_id = (int)(t - dec->tasks);
+		int n_mbs = (sps->pic_width_in_mbs + 1) * sps->pic_height_in_mbs - 1;
+		if (dec->mbs_buffer_mbs[task_id] != n_mbs) {
+			free(dec->mbs_buffers[task_id]);
+			dec->mbs_buffers[task_id] = aligned_alloc(16, (size_t)n_mbs * sizeof(Edge264MbScratch));
+			dec->mbs_buffer_mbs[task_id] = dec->mbs_buffers[task_id] ? n_mbs : 0;
+			// The column past each row is the "unavailable" sentinel, mirroring
+			// what alloc_frame() writes into the macroblock array.
+			if (dec->mbs_buffers[task_id]) {
+				for (int i = 0; i + sps->pic_width_in_mbs < n_mbs; i += sps->pic_width_in_mbs + 1)
+					dec->mbs_buffers[task_id][i + sps->pic_width_in_mbs] = unavail_mbs;
+			}
+		}
+		t->mbs_buffer = dec->mbs_buffers[task_id];
+	}
 	memcpy(t->samples_buffers, dec->samples_buffers, sizeof(t->samples_buffers));
 	t->samples_clip_v[0] = set16((1 << sps->BitDepth_Y) - 1);
 	t->samples_clip_v[1] = t->samples_clip_v[2] = set16((1 << sps->BitDepth_C) - 1);
@@ -994,6 +1053,13 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	t->pps = dec->PPS[pic_parameter_set_id];
 	if (!sps->BitDepth_Y || !t->pps.num_ref_idx_active[0])
 		return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG); // exit now if SPS or PPS wasn't initialized
+	
+	// 4:2:2 residual parsing is implemented for CABAC only: its chroma DC uses
+	// the nC==-2 coeff_token and the 4:2:2 total_zeros VLC tables, which are not
+	// built here. Refusing the slice keeps a CAVLC 4:2:2 stream reporting
+	// "unsupported" instead of silently desynchronising the bitstream.
+	if (sps->ChromaArrayType == 2 && !t->pps.entropy_coding_mode_flag)
+		return print_dec(dec, "  decode_NAL_result: %s\n", ENOTSUP);
 	
 	// keep frame_num on stack until we can compute FrameNum after all unset_currPic
 	int frame_num = get_uv(&dec->gb, sps->log2_max_frame_num);
@@ -1866,7 +1932,13 @@ int ADD_VARIANT(parse_seq_parameter_set)(Edge264Decoder *dec, Edge264UnrefCb unr
 		sps.ChromaArrayType = sps.chroma_format_idc = get_ue16(&dec->gb, 3);
 		log_dec(dec, "  chroma_format_idc: %u # %s%s\n",
 			sps.chroma_format_idc, chroma_format_idc_names[sps.chroma_format_idc], unsup_if(sps.chroma_format_idc != 1));
-		if (sps.chroma_format_idc != 1) {
+		// 4:2:2 (chroma_format_idc==2) is accepted for its RESIDUAL PARSING only -
+		// see parse_chroma_residual(). Chroma samples are decoded with 4:2:0
+		// geometry and are therefore wrong; this fork exists to extract motion
+		// vectors, which depend only on syntax elements and spatial mv
+		// prediction. CAVLC 4:2:2 is refused below, since its chroma DC uses VLC
+		// tables that are not implemented here.
+		if (sps.chroma_format_idc != 1 && sps.chroma_format_idc != 2) {
 			ret = ENOTSUP;
 			if (sps.chroma_format_idc == 3) {
 				int separate_colour_plane_flag = get_u1(&dec->gb);

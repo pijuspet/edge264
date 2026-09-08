@@ -1,6 +1,7 @@
 *
 !.gitignore
 !edge264*.c
+!extractor.c
 !edge264*.h
 !LICENSE_BSD.txt
 !Makefile

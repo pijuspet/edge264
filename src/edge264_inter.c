@@ -1106,6 +1106,11 @@ static void decode_inter_chroma(int w, int h, size_t sstride, const uint8_t *src
  * +----------+------------+--------------+------------+--------------+
  */
 static void noinline decode_inter(Edge264Context *ctx, int i, int w, int h) {
+	// mv_only: callers have already stored mb->mvs/refIdx by the time they get
+	// here, and everything below is pure motion compensation - the largest
+	// single cost in a decode that only wants the vectors.
+	if (ctx->t.mv_only)
+		return;
 	static int8_t shift_Y_8bit[46] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15};
 	static int8_t shift_C_8bit[22] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7};
 	

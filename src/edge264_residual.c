@@ -107,6 +107,11 @@ static const i8x16 normAdjust8x8[12] = {
  */
 static noinline void add_idct4x4(Edge264Context *ctx, int iYCbCr, int DCidx, uint8_t *p)
 {
+	// mv_only: keep the clear this function owes its callers, drop the transform
+	if (ctx->t.mv_only) {
+		ctx->c_v[0] = ctx->c_v[1] = ctx->c_v[2] = ctx->c_v[3] = (i8x16){};
+		return;
+	}
 	// loading and scaling
 	unsigned qP = ctx->t.QP[iYCbCr];
 	int sh = qP / 6;
@@ -172,6 +177,8 @@ static noinline void add_idct4x4(Edge264Context *ctx, int iYCbCr, int DCidx, uin
 }
 
 static void add_dc4x4(Edge264Context *ctx, int iYCbCr, int DCidx, uint8_t *p) {
+	if (ctx->t.mv_only) // reads coefficients, clears nothing
+		return;
 	i32x4 r = set16((ctx->c[16 + DCidx] + 32) >> 6);
 	size_t stride = ctx->t.stride[iYCbCr];
 	DECL_SSTRIDE(stride);
@@ -193,6 +200,12 @@ static void add_dc4x4(Edge264Context *ctx, int iYCbCr, int DCidx, uint8_t *p) {
  */
 static void add_idct8x8(Edge264Context *ctx, int iYCbCr, uint8_t *dst0)
 {
+	// mv_only: an 8x8 block spans c[0..63], so clear all sixteen vectors
+	if (ctx->t.mv_only) {
+		for (int i = 0; i < 16; i++)
+			ctx->c_v[i] = (i8x16){};
+		return;
+	}
 	// loading and scaling
 	unsigned qP = ctx->t.QP[iYCbCr];
 	if (ctx->t.samples_clip[iYCbCr][0] == 255) {
@@ -351,6 +364,12 @@ static void add_idct8x8(Edge264Context *ctx, int iYCbCr, uint8_t *dst0)
  */
 static void transform_dc4x4(Edge264Context *ctx, int iYCbCr)
 {
+	// mv_only: the DC values it would publish in c_v[4..7] are only read by
+	// add_idct4x4/add_dc4x4, which are stubbed out too.
+	if (ctx->t.mv_only) {
+		ctx->c_v[0] = ctx->c_v[1] = ctx->c_v[2] = ctx->c_v[3] = (i8x16){};
+		return;
+	}
 	// load matrix in column order and multiply right
 	i32x4 x0 = ctx->c_v[0] + ctx->c_v[1];
 	i32x4 x1 = ctx->c_v[2] + ctx->c_v[3];
@@ -455,6 +474,10 @@ static void transform_dc4x4(Edge264Context *ctx, int iYCbCr)
 
 static void transform_dc2x2(Edge264Context *ctx)
 {
+	if (ctx->t.mv_only) {
+		ctx->c_v[0] = ctx->c_v[1] = (i8x16){};
+		return;
+	}
 	// load both matrices interlaced+transposed and multiply right
 	i32x4 d0 = ctx->c_v[0] + ctx->c_v[1];
 	i32x4 d1 = ctx->c_v[0] - ctx->c_v[1];

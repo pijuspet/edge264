@@ -287,6 +287,8 @@ void edge264_free(Edge264Decoder **pdec) {
 			if (dec->samples_buffers[i] != NULL)
 				dec->free_cb(dec->samples_buffers[i], dec->mb_buffers[i], dec->alloc_arg);
 		}
+		for (int i = 0; i < 16; i++)
+			free(dec->mbs_buffers[i]); // plain malloc, not the caller's alloc_cb
 		free(dec);
 	}
 }

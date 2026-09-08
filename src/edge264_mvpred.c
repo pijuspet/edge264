@@ -111,7 +111,7 @@ static inline void decode_inter_16x16(Edge264Context *ctx, i16x8 mvd, int lx)
 	// sum mvp and mvd, broadcast everything to memory and tail-jump to decoding
 	i16x8 mv = mvp + mvd;
 	i16x8 mvs = broadcast32(mv, 0);
-	mb->absMvd_v[lx * 2] = mb->absMvd_v[lx * 2 + 1] = pack_absMvd(mvd);
+	sc->absMvd_v[lx * 2] = sc->absMvd_v[lx * 2 + 1] = pack_absMvd(mvd);
 	mb->mvs_v[lx * 4] = mb->mvs_v[lx * 4 + 1] = mb->mvs_v[lx * 4 + 2] = mb->mvs_v[lx * 4 + 3] = mvs;
 	decode_inter(ctx, lx * 16, 16, 16);
 }
@@ -153,7 +153,7 @@ static inline void decode_inter_8x16_left(Edge264Context *ctx, i16x8 mvd, int lx
 	// sum mvp and mvd, broadcast everything to memory and call decoding
 	i16x8 mv = mvp + mvd;
 	i16x8 mvs = broadcast32(mv, 0);
-	mb->absMvd_l[lx * 4] = mb->absMvd_l[lx * 4 + 2] = ((i64x2)pack_absMvd(mvd))[0];
+	sc->absMvd_l[lx * 4] = sc->absMvd_l[lx * 4 + 2] = ((i64x2)pack_absMvd(mvd))[0];
 	mb->mvs_v[lx * 4] = mb->mvs_v[lx * 4 + 2] = mvs;
 	decode_inter(ctx, lx * 16, 8, 16);
 }
@@ -194,7 +194,7 @@ static inline void decode_inter_8x16_right(Edge264Context *ctx, i16x8 mvd, int l
 	// sum mvp and mvd, broadcast everything to memory and call decoding
 	i16x8 mv = mvp + mvd;
 	i16x8 mvs = broadcast32(mv, 0);
-	mb->absMvd_l[lx * 4 + 1] = mb->absMvd_l[lx * 4 + 3] = ((i64x2)pack_absMvd(mvd))[0];
+	sc->absMvd_l[lx * 4 + 1] = sc->absMvd_l[lx * 4 + 3] = ((i64x2)pack_absMvd(mvd))[0];
 	mb->mvs_v[lx * 4 + 1] = mb->mvs_v[lx * 4 + 3] = mvs;
 	decode_inter(ctx, lx * 16 + 4, 8, 16);
 }
@@ -238,7 +238,7 @@ static inline void decode_inter_16x8_top(Edge264Context *ctx, i16x8 mvd, int lx)
 	// sum mvp and mvd, broadcast everything to memory and tail-jump to decoding
 	i16x8 mv = mvp + mvd;
 	i16x8 mvs = broadcast32(mv, 0);
-	mb->absMvd_v[lx * 2] = pack_absMvd(mvd);
+	sc->absMvd_v[lx * 2] = pack_absMvd(mvd);
 	mb->mvs_v[lx * 4 + 0] = mb->mvs_v[lx * 4 + 1] = mvs;
 	decode_inter(ctx, lx * 16, 16, 8);
 }
@@ -274,7 +274,7 @@ static inline void decode_inter_16x8_bottom(Edge264Context *ctx, i16x8 mvd, int 
 	// sum mvp and mvd, broadcast everything to memory and tail-jump to decoding
 	i16x8 mv = mvp + mvd;
 	i16x8 mvs = broadcast32(mv, 0);
-	mb->absMvd_v[lx * 2 + 1] = pack_absMvd(mvd);
+	sc->absMvd_v[lx * 2 + 1] = pack_absMvd(mvd);
 	mb->mvs_v[lx * 4 + 2] = mb->mvs_v[lx * 4 + 3] = mvs;
 	decode_inter(ctx, lx * 16 + 8, 16, 8);
 }

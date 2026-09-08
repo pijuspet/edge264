@@ -110,6 +110,67 @@ ffmpeg -i vid.mp4 -vcodec copy -bsf h264_mp4toannexb -an vid.264 # optional, con
 ```
 
 
+# Motion vector extraction
+
+`extractor.c` decodes a video and writes out its **motion vectors** instead of
+its pixels. It exists for benchmarking motion-vector extraction against other
+decoders, and it is what the
+[motion-vector-extractors](https://github.com/pijuspet/motion-vector-extractors)
+project installs as `extractor11`.
+
+```sh
+make extractor                                        # FFmpeg on the default paths
+make extractor FFMPEG_PREFIX=/path/to/ffmpeg-install  # or point it at one
+./extractor in.mp4 1 mvs.csv 0 1 0
+```
+
+Arguments are positional:
+`<input> <write csv> <output.csv> <verbose> <thread count> <keyframes only>`.
+It prints `<frames> <motion vectors> <peak RSS kB> <decode ms>` on stdout, and
+with `<write csv>` non-zero writes
+`frame,source,src_x,src_y,dst_x,dst_y` — one row per inter partition, `dst` the
+partition centre, `src = dst + mv/4`, `source` −1 for list 0 and +1 for list 1.
+Set `L0_ONLY=0` in the environment to keep list-1 rows, `MV_GRID=N` to keep at
+most one vector per NxN pixel cell, `MV_MIN_SIZE=N` to drop vectors shorter than
+N pixels.
+
+FFmpeg (libavformat/libavcodec/libavutil) is used **only to demux** containers
+into Annex-B; no pixel decoding happens there. A raw `.264` elementary stream
+needs no FFmpeg at all.
+
+## How it works
+
+The public API exports decoded samples, not motion, so `extractor.c` includes
+`src/edge264_internal.h` and reads `dec->mb_buffers[]` directly after each
+`edge264_get_frame()` — the same way `src/edge264_test.c` and
+`src/edge264_check.c` reach into the decoder. Partition shape comes from
+`inter_eqs_s` (`0x1b5fbbff` = 16x16, `0x1b5f1b5f` = 16x8, `0x1b1bbbbb` = 8x16,
+anything else 8x8), motion from `mvs[LX*32 + i4x4*2]` and `refIdx[LX*4 + i8x8]`.
+Granularity stops at 8x8 and vectors whose integer displacement truncates to
+zero are dropped, matching what FFmpeg's `AVMotionVector` export produces.
+
+## `mv_only` decoding
+
+`dec->mv_only = 1` puts the decoder in **parse-everything, reconstruct-nothing**
+mode, which is what makes this competitive with a decoder purpose-built for the
+job. Every syntax element, residual coefficient and CABAC bin is still decoded —
+the entropy decoder has to stay in sync — but motion compensation, intra
+prediction, residual application and deblocking are skipped, since none of them
+feed back into `mb_type`, `ref_idx`, `mvd` or motion-vector prediction. Exported
+vectors are bit-identical with the mode on or off; decoded samples are
+meaningless with it on, and nothing reads them.
+
+Measured single-threaded, 1080p: ~2.4x faster, and resident memory drops because
+the sample planes are never touched, so their pages are never faulted in.
+
+Macroblock state is split to suit this: `Edge264Macroblock` (176 B) holds what
+outlives a picture and is kept per frame slot, while `Edge264MbScratch` (128 B)
+holds entropy-decoding neighbour context and is kept **per task**, so a serial
+decoder keeps one copy rather than one per DPB entry. That is what lets many
+concurrent extractor processes scale — the working set, not the decode speed, is
+what saturates a shared cache.
+
+
 # Example code
 
 Here is a complete example that opens an input file in Annex B byte stream format from command line, and dumps its decoded frames in planar YUV order to standard output. See [edge264_test.c](src/edge264_test.c) for a more complete example which can also display frames.
