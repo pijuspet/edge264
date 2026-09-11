@@ -2,7 +2,7 @@
  *
  * Built by this directory's Makefile ("make extractor"); the
  * motion-vector-extractors project installs the result as
- * executables/extractor11 and benchmarks it as method 11.
+ * executables/extractor8 and benchmarks it as method 8.
  *
  * CLI:
  *   extractor <input> <print mv> <output.csv> <is verbose> <thread count> <keyframes only>

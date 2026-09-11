@@ -116,7 +116,7 @@ ffmpeg -i vid.mp4 -vcodec copy -bsf h264_mp4toannexb -an vid.264 # optional, con
 its pixels. It exists for benchmarking motion-vector extraction against other
 decoders, and it is what the
 [motion-vector-extractors](https://github.com/pijuspet/motion-vector-extractors)
-project installs as `extractor11`.
+project installs as `extractor8`.
 
 ```sh
 make extractor                                        # FFmpeg on the default paths
