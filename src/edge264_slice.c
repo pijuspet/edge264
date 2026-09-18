@@ -321,7 +321,21 @@
  * maintain, this function is designed to be simple and compact.
  */
 #if CABAC
-	static noinline void parse_residual_coeffs_cabac(Edge264Context *ctx, uint64_t significant_coeff_flags) {
+	/* mv_only: the coefficient VALUES are dead - every transform in
+	 * edge264_residual.c returns after clearing ctx->c, so nothing downstream
+	 * ever reads what this loop stores. The BINS are not dead: CABAC state is
+	 * adaptive, so each one must still be decoded to keep the decoder
+	 * synchronised, bit for bit.
+	 *
+	 * Guarding the store per-coefficient was measured once and came out 0.6%
+	 * SLOWER - a branch in the innermost loop costs more than the store it
+	 * skips. So the flag is a template parameter instead: two noinline
+	 * instantiations, the branch resolved at compile time, and the only runtime
+	 * test is one predictable check per residual BLOCK in the two callers
+	 * below. Same structure as the custom FFmpeg fork's *_skip residual
+	 * decoders, and for the same reason.
+	 */
+	static always_inline void parse_residual_coeffs_cabac_tmpl(Edge264Context *ctx, uint64_t significant_coeff_flags, int store) {
 		// Now loop on set bits to parse all non-zero coefficients.
 		int ctxIdx0 = ctx->ctxIdxOffsets[3] + 1;
 		int ctxIdx1 = ctx->ctxIdxOffsets[3] + 5;
@@ -372,9 +386,18 @@
 		
 			// store in transposed scan position
 			int i = 63 - __builtin_clzll(significant_coeff_flags);
-			ctx->c[ctx->scan[i]] = coeff_level;
+			if (store) // constant-folded away in the _skip instantiation
+				ctx->c[ctx->scan[i]] = coeff_level;
 			significant_coeff_flags &= ~((uint64_t)1 << i);
 		} while (significant_coeff_flags != 0);
+	}
+	
+	static noinline void parse_residual_coeffs_cabac(Edge264Context *ctx, uint64_t significant_coeff_flags) {
+		parse_residual_coeffs_cabac_tmpl(ctx, significant_coeff_flags, 1);
+	}
+	
+	static noinline void parse_residual_coeffs_cabac_skip(Edge264Context *ctx, uint64_t significant_coeff_flags) {
+		parse_residual_coeffs_cabac_tmpl(ctx, significant_coeff_flags, 0);
 	}
 	
 	static noinline void parse_residual_block_8x8_cabac(Edge264Context * restrict ctx, int startIdx, int endIdx) {
@@ -388,7 +411,10 @@
 			}
 		} while (++i < endIdx);
 		significant_coeff_flags |= (uint64_t)1 << i;
-		parse_residual_coeffs_cabac(ctx, significant_coeff_flags);
+		if (ctx->t.mv_only)
+			parse_residual_coeffs_cabac_skip(ctx, significant_coeff_flags);
+		else
+			parse_residual_coeffs_cabac(ctx, significant_coeff_flags);
 	}
 	
 	static noinline void parse_residual_block_cabac(Edge264Context * restrict ctx, int startIdx, int endIdx) {
@@ -403,7 +429,10 @@
 			}
 		} while (++i < endIdx);
 		significant_coeff_flags |= 1 << i;
-		parse_residual_coeffs_cabac(ctx, significant_coeff_flags);
+		if (ctx->t.mv_only)
+			parse_residual_coeffs_cabac_skip(ctx, significant_coeff_flags);
+		else
+			parse_residual_coeffs_cabac(ctx, significant_coeff_flags);
 	}
 #endif
 

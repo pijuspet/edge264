@@ -914,7 +914,18 @@ static void parse_ref_pic_list_modification(Edge264Decoder *dec, Edge264SeqParam
 			log_dec(dec, "]\n");
 		}
 	}
-	
+
+	unsigned stored = (dec->view_short_term_frames | dec->view_long_term_frames) & ~(1u << dec->currPic);
+	for (int l = 0; l <= t->slice_type; l++) {
+		int fallback = t->RefPicList[l][0] >= 0 ? t->RefPicList[l][0] :
+			t->RefPicList[0][0] >= 0 ? t->RefPicList[0][0] :
+			stored ? __builtin_ctz(stored) : -1;
+		for (int i = 0; fallback >= 0 && i < t->pps.num_ref_idx_active[l]; i++) {
+			if (t->RefPicList[l][i] < 0)
+				t->RefPicList[l][i] = fallback;
+		}
+	}
+
 	#ifdef LOGS
 		for (int lx = 0; lx <= t->slice_type; lx++) {
 			log_dec(dec, lx == 0 ? "  RefPicLists: [[" : "], [");

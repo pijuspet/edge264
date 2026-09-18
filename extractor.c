@@ -12,6 +12,9 @@
  * collect_process_results() in crates/mv-bench/benchmark_extractors.rs).
  * Output (when print!=0): the compact CSV `frame,source,src_x,src_y,dst_x,dst_y`
  * every other method writes.
+ * Environment: L0_ONLY, MV_MIN_SIZE, MV_GRID, and the picture-dropping knobs
+ * MV_SKIP_FRAME / MV_SKIP_EVERY_NTH / MV_DECODE_EVERY_NTH (see "Temporal
+ * decimation" below).
  *
  * WHY IT REACHES INTO edge264's INTERNALS
  * edge264's public API (edge264.h) exports decoded samples, not motion. The
@@ -186,6 +189,7 @@ typedef struct { int16_t source, sx, sy, dx, dy; } MvRow;
 /* One decoded picture's vectors, waiting in the reorder buffer. */
 typedef struct {
     int32_t poc;      /* picture order count: display position within the GOP */
+    int32_t frame;    /* CSV frame number from SourceIndex, -1 = next display index */
     MvRow *rows;
     int n, cap;
 } PendingPic;
@@ -314,8 +318,11 @@ typedef struct {
 static void reorder_write(Reorder *ro, PendingPic *p, Writer *w) {
     ro->last_out_poc = p->poc;
     ro->have_out = 1;
+    /* Under decimation the number is the picture's source position, so a
+     * dropped picture's number stays unused - see SourceIndex. */
+    int frame = p->frame >= 0 ? p->frame : ro->out_frame;
     for (int i = 0; i < p->n; i++)
-        w_row(w, ro->out_frame, p->rows[i].source, p->rows[i].sx, p->rows[i].sy,
+        w_row(w, frame, p->rows[i].source, p->rows[i].sx, p->rows[i].sy,
               p->rows[i].dx, p->rows[i].dy);
     ro->out_frame++;
     free(p->rows);
@@ -371,6 +378,126 @@ static void reorder_push(Reorder *ro, PendingPic p, Writer *w) {
         reorder_pop(ro, w);
 }
 
+enum { SKIP_NONE, SKIP_NONREF, SKIP_BIDIR, SKIP_NONINTRA, SKIP_NONKEY, SKIP_ALL };
+
+typedef struct {
+    int skip_level;   /* MV_SKIP_FRAME */
+    int skip_nth;     /* MV_SKIP_EVERY_NTH: drop every Nth, keep the rest */
+    int decode_nth;   /* MV_DECODE_EVERY_NTH: keep every Nth, drop the rest */
+    int pic_index;    /* the fork's mv_pic_index: non-IDR pictures seen */
+    int drop_pic;     /* decision for the picture whose slices are arriving */
+    int dropped;      /* pictures withheld, for the verbose line */
+} Decimation;
+
+static int decimating(const Decimation *d) {
+    return d->skip_level > SKIP_NONE || d->skip_nth > 1 || d->decode_nth > 1;
+}
+
+/* FFmpeg's skip_frame vocabulary, in AVDiscard order. */
+static int skip_frame_level(const char *v) {
+    static const char *const names[] = {"none", "noref", "bidir", "nointra", "nokey", "all"};
+    if (!v || !*v)
+        return SKIP_NONE;
+    for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
+        if (!strcmp(v, names[i]))
+            return i;
+    fprintf(stderr, "extractor: MV_SKIP_FRAME=%s not recognised, decoding every picture\n", v);
+    return SKIP_NONE;
+}
+
+/* ue(v) from an RBSP bit buffer; -1 if it runs past the end. */
+static int read_ue(const uint8_t *buf, int nbits, int *pos) {
+    int zeros = 0;
+    while (*pos < nbits && !(buf[*pos >> 3] & (0x80 >> (*pos & 7)))) {
+        zeros++;
+        (*pos)++;
+    }
+    if (zeros > 30 || *pos + 1 + zeros > nbits)
+        return -1;
+    (*pos)++;
+    unsigned v = 0;
+    for (int i = 0; i < zeros; i++, (*pos)++)
+        v = v << 1 | !!(buf[*pos >> 3] & (0x80 >> (*pos & 7)));
+    return (int)((1u << zeros) - 1 + v);
+}
+
+/* first_mb_in_slice and slice_type, the first two slice header fields. They
+ * fit in a few bytes, so only those are unescaped. */
+static int slice_head(const uint8_t *nal, const uint8_t *end, int *first_mb, int *slice_type) {
+    uint8_t rbsp[8];
+    int n = 0, zeros = 0;
+    for (const uint8_t *p = nal + 1; p < end && n < (int)sizeof rbsp; p++) {
+        if (zeros >= 2 && *p == 3) {   /* emulation prevention byte */
+            zeros = 0;
+            continue;
+        }
+        zeros = *p ? 0 : zeros + 1;
+        rbsp[n++] = *p;
+    }
+    int pos = 0;
+    *first_mb = read_ue(rbsp, n * 8, &pos);
+    *slice_type = read_ue(rbsp, n * 8, &pos);
+    return *first_mb >= 0 && *slice_type >= 0;
+}
+
+/* Should this slice NAL (type 1 or 5) be withheld from the decoder? */
+static int drop_slice(Decimation *d, const uint8_t *nal, const uint8_t *end) {
+    int first_mb, slice_type;
+    if (!slice_head(nal, end, &first_mb, &slice_type))
+        return 0;                 /* malformed: leave it to edge264 to reject */
+    if (first_mb != 0)
+        return d->drop_pic;
+    int idr = (*nal & 0x1f) == 5;
+    int type = slice_type % 5;    /* 0 P, 1 B, 2 I, 3 SP, 4 SI */
+    int lvl = d->skip_level;
+    int drop = lvl >= SKIP_NONREF && !(*nal >> 5 & 3);   /* uncounted, see above */
+    if (!drop && (d->skip_nth > 1 || d->decode_nth > 1) && !idr) {
+        int idx = d->pic_index++;
+        drop = (d->skip_nth > 1 && idx % d->skip_nth == 0) ||
+               (d->decode_nth > 1 && idx % d->decode_nth != 0);
+    }
+    if (!drop) {
+        /* slice_type_nos, as FFmpeg tests it: SP counts as P and SI as I. */
+        drop = (lvl >= SKIP_BIDIR    && type == 1) ||
+               (lvl >= SKIP_NONINTRA && type != 2 && type != 4) ||
+               (lvl >= SKIP_NONKEY   && !idr) ||
+               lvl >= SKIP_ALL;
+    }
+    d->drop_pic = drop;
+    d->dropped += drop;
+    return drop;
+}
+
+#define PTS_SLOTS 64   /* power of two, well past edge264's 32 frame slots */
+
+typedef struct {
+    int64_t ticks;             /* PTS units per picture; 0 = sequential */
+    int64_t origin;            /* PTS of index 0, AV_NOPTS_VALUE until known */
+    int32_t id[PTS_SLOTS];     /* FrameId -> PTS, slot FrameId & (PTS_SLOTS - 1) */
+    int64_t pts[PTS_SLOTS];
+} SourceIndex;
+
+static void si_record(SourceIndex *si, int32_t frame_id, int64_t pts) {
+    int s = frame_id & (PTS_SLOTS - 1);
+    si->id[s] = frame_id;
+    si->pts[s] = pts;
+}
+
+/* Source position of an output picture, or -1 for "next display index". */
+static int si_lookup(SourceIndex *si, int32_t frame_id) {
+    if (!si->ticks)
+        return -1;
+    int s = frame_id & (PTS_SLOTS - 1);
+    if (si->id[s] != frame_id || si->pts[s] == AV_NOPTS_VALUE)
+        return -1;
+    /* No container start time: the first picture out is index 0. Every skip
+     * mode keeps IDR, so that is the first picture in as well. */
+    if (si->origin == AV_NOPTS_VALUE)
+        si->origin = si->pts[s];
+    int64_t delta = si->pts[s] - si->origin;
+    return delta < 0 ? -1 : (int)((delta + si->ticks / 2) / si->ticks);
+}
+
 /* ===========================================================================
  * Decoder driving
  * ======================================================================== */
@@ -383,6 +510,9 @@ typedef struct {
     int packets;     /* video access units demuxed, decoded or not */
     int keyframes_only;
     int verbose;
+    Decimation dm;
+    SourceIndex si;
+    int32_t last_frame_id;  /* dec->prevFrameId as of the last NAL fed */
     /* NAL outcomes, so a stream edge264 cannot decode reports why instead of
      * quietly producing a header-only CSV. ENOTSUP on a sequence parameter set
      * is the interesting one: it means the stream uses an H.264 feature this
@@ -417,6 +547,7 @@ static void drain(Run *r) {
                 /* Display position of this picture. edge264 hands them back in
                  * decode order, so this is what the CSV must be sorted by. */
                 p.poc = dec->FieldOrderCnt[0][pic];
+                p.frame = si_lookup(&r->si, out.FrameId);
                 r->ex.cur = &p;
                 flt_reset(r->ex.flt, mb_w * 16, mb_h * 16);
                 export_picture(&r->ex, mbs, mb_w, mb_h);
@@ -432,7 +563,7 @@ static void drain(Run *r) {
 /* Feed one Annex-B chunk (one demuxed access unit, start codes included).
  * Mirrors the loop in edge264's src/edge264_test.c: ENOBUFS means the decoder
  * is out of frame slots and the same NAL must be retried after draining. */
-static void feed(Run *r, const uint8_t *buf, size_t len) {
+static void feed(Run *r, const uint8_t *buf, size_t len, int64_t pts) {
     const uint8_t *end0 = buf + len;
     r->packets++;
     const uint8_t *nal = edge264_find_start_code(buf, end0, 0);
@@ -441,17 +572,29 @@ static void feed(Run *r, const uint8_t *buf, size_t len) {
     nal += 3;
     while (nal < end0) {
         const uint8_t *end = edge264_find_start_code(nal, end0, 0);
+        int nal_type = *nal & 0x1f;
         /* Keyframes-only drops non-IDR slices (type 1) and keeps parameter
          * sets, so every surviving picture is a self-contained IDR — the same
-         * frames AVDISCARD_NONKEY leaves the FFmpeg extractors. */
-        if (!r->keyframes_only || (*nal & 0x1f) != 1) {
+         * frames AVDISCARD_NONKEY leaves the FFmpeg extractors. Decimation
+         * then sees only what that lets through, as libavcodec only ever sees
+         * the packets the demuxer kept. */
+        int keep = !r->keyframes_only || nal_type != 1;
+        if (keep && (nal_type == 1 || nal_type == 5) && decimating(&r->dm))
+            keep = !drop_slice(&r->dm, nal, end);
+        if (keep) {
             /* ENOBUFS means every frame slot is taken; drain() frees one, so
              * the retry makes progress. The bound only guards against a
              * decoder state where it never can, which would otherwise hang. */
             int res, tries = 0;
-            int nal_type = *nal & 0x1f;
             do {
                 res = edge264_decode_NAL(r->dec, nal, end, NULL, NULL);
+                /* A picture's first slice gives it FrameId ++prevFrameId. Tie
+                 * the access unit's PTS to it before drain(), which can hand
+                 * that same picture straight back. */
+                if (r->dec->prevFrameId != r->last_frame_id) {
+                    r->last_frame_id = r->dec->prevFrameId;
+                    si_record(&r->si, r->last_frame_id, pts);
+                }
                 drain(r);
             } while (res == ENOBUFS && ++tries < 64);
             if (res == ENOTSUP) {
@@ -489,6 +632,22 @@ static int run_demux(Run *r, const char *path) {
         goto done;
     }
 
+    if (decimating(&r->dm)) {
+        /* Same rate and time base SourceFrameIndex::new() uses. */
+        AVRational fr = st->avg_frame_rate;
+        if (fr.num <= 0 || fr.den <= 0)
+            fr = st->r_frame_rate;
+        if (fr.num > 0 && fr.den > 0 && st->time_base.num > 0 && st->time_base.den > 0)
+            r->si.ticks = av_rescale_q(1, av_inv_q(fr), st->time_base);
+        if (r->si.ticks > 0) {
+            r->si.origin = st->start_time;
+        } else {
+            r->si.ticks = 0;
+            fprintf(stderr, "extractor: MV_SKIP_*: stream has no usable frame rate - "
+                            "CSV frame numbers stay sequential\n");
+        }
+    }
+
     const AVBitStreamFilter *bsf = av_bsf_get_by_name("h264_mp4toannexb");
     if (bsf) {
         if (av_bsf_alloc(bsf, &bsfc) < 0)
@@ -507,12 +666,12 @@ static int run_demux(Run *r, const char *path) {
             if (bsfc) {
                 if (av_bsf_send_packet(bsfc, pkt) == 0) {
                     while (av_bsf_receive_packet(bsfc, op) == 0) {
-                        feed(r, op->data, op->size);
+                        feed(r, op->data, op->size, op->pts);
                         av_packet_unref(op);
                     }
                 }
             } else {
-                feed(r, pkt->data, pkt->size);
+                feed(r, pkt->data, pkt->size, pkt->pts);
             }
         }
         av_packet_unref(pkt);
@@ -520,7 +679,7 @@ static int run_demux(Run *r, const char *path) {
     if (bsfc) {
         av_bsf_send_packet(bsfc, NULL);
         while (av_bsf_receive_packet(bsfc, op) == 0) {
-            feed(r, op->data, op->size);
+            feed(r, op->data, op->size, op->pts);
             av_packet_unref(op);
         }
     }
@@ -594,6 +753,11 @@ int main(int argc, char **argv) {
     if (mv_min_size > 32767) mv_min_size = 32767;
     if (mv_grid < 0) mv_grid = 0;
     if (mv_grid > 32767) mv_grid = 32767;
+    Decimation dm = {
+        .skip_level = skip_frame_level(getenv("MV_SKIP_FRAME")),
+        .skip_nth = env_int("MV_SKIP_EVERY_NTH", 0),
+        .decode_nth = env_int("MV_DECODE_EVERY_NTH", 0),
+    };
 
     static Writer w;
     if (do_print) {
@@ -618,7 +782,10 @@ int main(int argc, char **argv) {
     MvFilter flt;
     flt_init(&flt, mv_min_size, mv_grid);
 
-    Run r = { .dec = dec, .keyframes_only = keyframes_only, .verbose = verbose };
+    Run r = { .dec = dec, .keyframes_only = keyframes_only, .verbose = verbose,
+              .dm = dm, .last_frame_id = -1 };
+    r.si.origin = AV_NOPTS_VALUE;
+    memset(r.si.id, 0xff, sizeof r.si.id);   /* -1: no FrameId recorded */
     r.ex.l0_only = l0_only;
     r.ex.collecting = do_print != 0;
     r.ex.flt = &flt;
@@ -701,8 +868,8 @@ int main(int argc, char **argv) {
     }
 
     if (verbose)
-        fprintf(stderr, "extractor (edge264): pictures=%d packets=%d mvs=%llu serial l0_only=%d\n",
-                r.frames, r.packets, (unsigned long long)r.ex.count, l0_only);
+        fprintf(stderr, "extractor (edge264): pictures=%d packets=%d dropped=%d mvs=%llu serial l0_only=%d\n",
+                r.frames, r.packets, r.dm.dropped, (unsigned long long)r.ex.count, l0_only);
 
     printf("%d %llu %ld %.3f\n", reported, (unsigned long long)r.ex.count, mem, decode_ms);
     return 0;
