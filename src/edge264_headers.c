@@ -112,7 +112,19 @@ static void flush_frames(Edge264Decoder *dec) {
 
 static int alloc_frame(Edge264Decoder *dec, int id, int errno_on_fail) {
 	int mbs = (dec->sps.pic_width_in_mbs + 1) * dec->sps.pic_height_in_mbs - 1;
-	unsigned samples_size = dec->plane_size_Y + dec->plane_size_C + 16; // plus margin for overreads
+	// mv_only: the sample planes are never touched - motion compensation, intra
+	// prediction, I_PCM, the inverse transforms and deblocking all skip them in
+	// this mode, and callers read motion out of mb_buffers[], not samples. So the
+	// full Y+C planes are not allocated: at 1080p 4:2:0 that drops ~3 MB of dead
+	// buffer per DPB slot (the mb array below is unchanged). The samples_buffers[id]
+	// pointer stays non-NULL so it still works as the "slot allocated" sentinel,
+	// and samples_mb / out.samples pointer arithmetic computed elsewhere stays
+	// valid-shaped though it is never dereferenced.
+	// What remains is one Edge264Macroblock of margin: the last macroblock of row 0
+	// loads its (unavailable, masked-out) C neighbour from m[-1], one slot before
+	// the mb array. internal_alloc places the mb array right after the samples,
+	// so the full-size planes used to absorb that read - keep it in bounds here.
+	unsigned samples_size = dec->mv_only ? sizeof(Edge264Macroblock) : dec->plane_size_Y + dec->plane_size_C + 16; // plus margin for overreads
 	unsigned mbs_size = sizeof(Edge264Macroblock) * mbs;
 	dec->alloc_cb((void **)&dec->samples_buffers[id], samples_size, (void **)&dec->mb_buffers[id], mbs_size, errno_on_fail, dec->alloc_arg);
 	Edge264Macroblock *m = dec->mb_buffers[id];
@@ -325,6 +337,13 @@ static void recover_slice(Edge264Context *ctx, int currPic) {
 		// recover the macroblock depending on slice_type
 		// FIXME use Intra function instead
 		if (ctx->t.slice_type == 2) { // I slice -> blend with intra DC
+			// Pixel concealment only. In mv_only the samples are discarded and a
+			// recovered intra macroblock carries no motion, so this whole block is
+			// skipped - it would otherwise read/write the elided sample planes and
+			// overrun them. Motion recovery for P/B slices is in the else-if below
+			// and stays active. The recovery_bits store and pointer advance after
+			// this if/else still run, so error bookkeeping is unchanged.
+			if (!ctx->t.mv_only) {
 			size_t stride_Y = ctx->t.stride[0];
 			DECL_SSTRIDE(stride_Y);
 			uint8_t * restrict y0 = ctx->samples_mb[0];
@@ -410,6 +429,7 @@ static void recover_slice(Edge264Context *ctx, int currPic) {
 			*(int64_t *)DADDR(cE, -1) = v6[1];
 			*(int64_t *)DADDR(cE,  0) = v7[0];
 			*(int64_t *)DADDR(cE,  1) = v7[1];
+			} // end !mv_only pixel concealment
 		} else if (i > 0 && p128 >= 32) { // recover above 25% error (arbitrary)
 			if (ctx->t.slice_type == 0) { // P slice -> P_Skip
 				sc->nC_v[0] = (i8x16){};
@@ -1169,6 +1189,11 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		sps->log2_max_frame_num, dec->FrameNum);
 	
 	// check for gaps in frame_num (8.2.5.2)
+	// Kept in mv_only too, although nothing motion-compensates against the
+	// non-existing frames: they still shape RefPicList, and B-direct prediction
+	// reads RefPicList1[0]'s motion. Skipping this block under decimation was
+	// measured to lose vectors (bus MV_DECODE_EVERY_NTH=3: recall vs the full
+	// decode 0.967 -> 0.946).
 	int gap = dec->FrameNum - dec->PrevRefFrameNum[non_base_view];
 	if (__builtin_expect(gap > 1, 0)) {
 		// make enough non-reference slots by dereferencing short-term and non-existing frames

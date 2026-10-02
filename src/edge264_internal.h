@@ -1400,7 +1400,18 @@ static void cabac_init(Edge264Context *ctx);
 static noinline void deblock_mb(Edge264Context *ctx);
 
 // edge264_inter.c
-static void noinline decode_inter(Edge264Context *ctx, int i, int w, int h);
+static void noinline decode_inter_mc(Edge264Context *ctx, int i, int w, int h);
+// mv_only: decode_inter_mc is pure motion compensation and produces only samples,
+// which this mode discards; the vectors it needs are already stored by the caller.
+// Gating the call here rather than with an early return inside the noinline body
+// elides the call and its prologue entirely - up to 16 per macroblock on sub-8x8
+// B-partitions - leaving one compile-time-predictable branch at each call site.
+// A macro (like CACALL) rather than an inline wrapper, so translation units that
+// include this header but not edge264_inter.c never reference decode_inter_mc.
+#define decode_inter(ctx, i, w, h) do { \
+	if (!(ctx)->t.mv_only) \
+		decode_inter_mc((ctx), (i), (w), (h)); \
+} while (0)
 
 // edge264_intra.c
 static cold noinline void decode_intra4x4(uint8_t * restrict p, size_t stride, int mode, i16x8 clip);

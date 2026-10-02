@@ -13,8 +13,8 @@
  * Output (when print!=0): the compact CSV `frame,source,src_x,src_y,dst_x,dst_y`
  * every other method writes.
  * Environment: L0_ONLY, MV_MIN_SIZE, MV_GRID, and the picture-dropping knobs
- * MV_SKIP_FRAME / MV_SKIP_EVERY_NTH / MV_DECODE_EVERY_NTH (see "Temporal
- * decimation" below).
+ * MV_SKIP_FRAME / MV_SKIP_EVERY_NTH / MV_DECODE_EVERY_NTH / MV_MIN_FRAME_BYTES
+ * (see "Temporal decimation" below).
  *
  * WHY IT REACHES INTO edge264's INTERNALS
  * edge264's public API (edge264.h) exports decoded samples, not motion. The
@@ -384,13 +384,21 @@ typedef struct {
     int skip_level;   /* MV_SKIP_FRAME */
     int skip_nth;     /* MV_SKIP_EVERY_NTH: drop every Nth, keep the rest */
     int decode_nth;   /* MV_DECODE_EVERY_NTH: keep every Nth, drop the rest */
+    int min_bytes;    /* MV_MIN_FRAME_BYTES: drop non-IDR pictures whose coded
+                         access unit is smaller than this - a content-adaptive
+                         alternative to the blind every-Nth knobs. On a stationary
+                         camera an all-skip P-frame is tiny, so a byte threshold
+                         drops the still frames while keeping every frame that
+                         actually carries motion. IDR is always kept. */
+    int au_bytes;     /* coded size of the access unit currently arriving */
     int pic_index;    /* the fork's mv_pic_index: non-IDR pictures seen */
     int drop_pic;     /* decision for the picture whose slices are arriving */
     int dropped;      /* pictures withheld, for the verbose line */
 } Decimation;
 
 static int decimating(const Decimation *d) {
-    return d->skip_level > SKIP_NONE || d->skip_nth > 1 || d->decode_nth > 1;
+    return d->skip_level > SKIP_NONE || d->skip_nth > 1 || d->decode_nth > 1 ||
+           d->min_bytes > 0;
 }
 
 /* FFmpeg's skip_frame vocabulary, in AVDiscard order. */
@@ -456,6 +464,12 @@ static int drop_slice(Decimation *d, const uint8_t *nal, const uint8_t *end) {
         drop = (d->skip_nth > 1 && idx % d->skip_nth == 0) ||
                (d->decode_nth > 1 && idx % d->decode_nth != 0);
     }
+    /* Content-adaptive drop: a tiny non-IDR picture is (on a static scene) an
+     * all-skip frame with no motion worth extracting. Safe for the vectors kept
+     * downstream - P-slice mv prediction never reads a dropped picture's motion
+     * field, and the decoder's mv_only path tolerates the missing reference. */
+    if (!drop && d->min_bytes > 0 && !idr && d->au_bytes > 0 && d->au_bytes < d->min_bytes)
+        drop = 1;
     if (!drop) {
         /* slice_type_nos, as FFmpeg tests it: SP counts as P and SI as I. */
         drop = (lvl >= SKIP_BIDIR    && type == 1) ||
@@ -663,6 +677,13 @@ static int run_demux(Run *r, const char *path) {
 
     while (av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index == vs) {
+            /* Coded size of this access unit, read by drop_slice's
+             * MV_MIN_FRAME_BYTES gate. Taken from the demuxed packet, not the
+             * Annex-B one feed() gets: that is exactly what the custom FFmpeg's
+             * mv_min_frame_bytes measures (avpkt->size), so methods 5 and 8
+             * drop the same pictures. The BSF's start codes and in-band
+             * SPS/PPS would shift it by a byte or so per NAL. */
+            r->dm.au_bytes = pkt->size;
             if (bsfc) {
                 if (av_bsf_send_packet(bsfc, pkt) == 0) {
                     while (av_bsf_receive_packet(bsfc, op) == 0) {
@@ -757,7 +778,9 @@ int main(int argc, char **argv) {
         .skip_level = skip_frame_level(getenv("MV_SKIP_FRAME")),
         .skip_nth = env_int("MV_SKIP_EVERY_NTH", 0),
         .decode_nth = env_int("MV_DECODE_EVERY_NTH", 0),
+        .min_bytes = env_int("MV_MIN_FRAME_BYTES", 0),
     };
+    if (dm.min_bytes < 0) dm.min_bytes = 0;
 
     static Writer w;
     if (do_print) {

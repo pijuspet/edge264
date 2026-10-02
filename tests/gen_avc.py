@@ -105,6 +105,7 @@ def gen_slice_data_cavlc(bits, f, slice, slice_type):
 		if mb.mb_type == [30, 48, 25][slice_type]: # I_PCM
 			num = bits.bit_length() - 1
 			bits <<= -num % 8 # pcm_alignment_zero_bit
+			mb.pcm_samples = SimpleNamespace(**mb.pcm_samples) # nested, so map_dicts left it a dict
 			for sample in mb.pcm_samples.Y:
 				bits = bits << mb.pcm_samples.bits_Y | sample
 			for sample in mb.pcm_samples.Cb + mb.pcm_samples.Cr:

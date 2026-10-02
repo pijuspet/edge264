@@ -996,10 +996,15 @@ static noinline void CAFUNC(parse_I_mb, int mb_type_or_ctxIdx)
 			ctx->log_indent,
 			ctx->log_indent, ctz(ctx->t.samples_clip[0][0] + 1),
 			ctx->log_indent, ctz(ctx->t.samples_clip[1][0] + 1));
+		// mv_only: alloc_frame elides the sample planes (and the mb array sits
+		// right after them), so pcm_samples are still consumed from the
+		// bitstream but all rows land in this one scratch row instead.
+		uint32_t pcm_row[8];
 		for (int iYCbCr = 0; iYCbCr < 3; iYCbCr++) {
 			log_mb(ctx, "%s  %s: [", ctx->log_indent, (const char *)"Y\0\0Cb\0Cr" + iYCbCr * 3);
 			int BitDepth = ctz(ctx->t.samples_clip[iYCbCr][0] + 1);
-			for (uint8_t *p = ctx->samples_mb[iYCbCr]; y-- > 0; p += ctx->t.stride[iYCbCr]) {
+			size_t stride = ctx->t.mv_only ? 0 : ctx->t.stride[iYCbCr];
+			for (uint8_t *p = ctx->t.mv_only ? (uint8_t *)pcm_row : ctx->samples_mb[iYCbCr]; y-- > 0; p += stride) {
 				if (BitDepth == 8) {
 					((uint32_t *)p)[0] = big_endian32(get_uv(&ctx->t.gb, 32));
 					((uint32_t *)p)[1] = big_endian32(get_uv(&ctx->t.gb, 32));
