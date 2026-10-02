@@ -5,15 +5,15 @@
  * executables/extractor8 and benchmarks it as method 8.
  *
  * CLI:
- *   extractor <input> <print mv> <output.csv> <is verbose> <thread count> <keyframes only>
+ *   extractor <input> <print mv> <output.csv> <is verbose> <thread count>
  * stdout: "<frames> <mvs> <rss_kb> <decode_ms>".
  * Both are the contract the motion-vector-extractors benchmark harness expects
  * (ExtractorArgs in crates/mv-extract/ffmpeg_common.rs, and
  * collect_process_results() in crates/mv-bench/benchmark_extractors.rs).
  * Output (when print!=0): the compact CSV `frame,source,src_x,src_y,dst_x,dst_y`
  * every other method writes.
- * Environment: L0_ONLY, MV_MIN_SIZE, MV_GRID, and the picture-dropping knobs
- * MV_SKIP_FRAME / MV_SKIP_EVERY_NTH / MV_DECODE_EVERY_NTH / MV_MIN_FRAME_BYTES
+ * Environment: L0_ONLY, and the picture-dropping knobs
+ * MV_SKIP_FRAME / MV_SKIP_EVERY_NTH / MV_DECODE_EVERY_NTH
  * (see "Temporal decimation" below).
  *
  * WHY IT REACHES INTO edge264's INTERNALS
@@ -64,62 +64,6 @@
 #undef mbB
 #undef mbC
 #undef mbD
-
-/* ===========================================================================
- * MV export filters — the makefile's MV_MIN_SIZE / MV_GRID, mirroring the
- * fork's mv_min_size / mv_grid AVOptions and extractor10's MvFilter. They
- * shrink the OUTPUT only; the picture is fully decoded either way.
- * ======================================================================== */
-typedef struct {
-    int min_size2;     /* squared length threshold, 0 = off */
-    int grid;          /* cell size in pixels, 0 = off */
-    int cols, rows;
-    uint8_t *taken;    /* one flag per grid cell, cleared per picture */
-} MvFilter;
-
-static void flt_init(MvFilter *f, int min_size, int grid) {
-    f->min_size2 = min_size * min_size;
-    f->grid = grid;
-    f->cols = f->rows = 0;
-    f->taken = NULL;
-}
-
-/* Called once per picture. Frame dimensions are only known after an SPS has
- * been parsed, so the cell map is sized on first use and kept afterwards. */
-static void flt_reset(MvFilter *f, int w, int h) {
-    if (f->grid <= 0)
-        return;
-    int cols = (w + f->grid - 1) / f->grid, rows = (h + f->grid - 1) / f->grid;
-    if (cols != f->cols || rows != f->rows) {
-        free(f->taken);
-        f->taken = calloc((size_t)cols * rows, 1);
-        f->cols = cols;
-        f->rows = rows;
-        if (!f->taken)
-            f->grid = 0;   /* out of memory: degrade to "no grid" rather than die */
-        return;
-    }
-    memset(f->taken, 0, (size_t)f->cols * f->rows);
-}
-
-static void flt_free(MvFilter *f) { free(f->taken); f->taken = NULL; }
-
-/* Size threshold first, grid last, so a cell is claimed by a vector that
- * actually passed the threshold (same order as the fork). */
-static int flt_keep(MvFilter *f, int src_x, int src_y, int dst_x, int dst_y) {
-    if (f->min_size2 > 0) {
-        int dx = dst_x - src_x, dy = dst_y - src_y;
-        if (dx * dx + dy * dy < f->min_size2)
-            return 0;
-    }
-    if (f->grid > 0) {
-        size_t cell = (size_t)(dst_y / f->grid) * f->cols + dst_x / f->grid;
-        if (f->taken[cell])
-            return 0;
-        f->taken[cell] = 1;
-    }
-    return 1;
-}
 
 /* ===========================================================================
  * CSV output
@@ -197,7 +141,6 @@ typedef struct {
 typedef struct {
     int l0_only;
     int collecting;   /* 0 when no CSV is wanted: count only, store nothing */
-    MvFilter *flt;
     uint64_t count;
     PendingPic *cur;  /* picture currently being walked */
 } ExportCtx;
@@ -207,8 +150,6 @@ static inline void emit(ExportCtx *e, int source, int dst_x, int dst_y, const in
     int src_y = dst_y + mv[1] / 4;   /* motion_x / motion_scale */
     if (src_x == dst_x && src_y == dst_y)
         return;                       /* sub-pel motion, zero integer displacement */
-    if (!flt_keep(e->flt, src_x, src_y, dst_x, dst_y))
-        return;
     e->count++;
     if (!e->collecting)
         return;       /* nothing will be written, so do not pay to buffer it */
@@ -384,21 +325,13 @@ typedef struct {
     int skip_level;   /* MV_SKIP_FRAME */
     int skip_nth;     /* MV_SKIP_EVERY_NTH: drop every Nth, keep the rest */
     int decode_nth;   /* MV_DECODE_EVERY_NTH: keep every Nth, drop the rest */
-    int min_bytes;    /* MV_MIN_FRAME_BYTES: drop non-IDR pictures whose coded
-                         access unit is smaller than this - a content-adaptive
-                         alternative to the blind every-Nth knobs. On a stationary
-                         camera an all-skip P-frame is tiny, so a byte threshold
-                         drops the still frames while keeping every frame that
-                         actually carries motion. IDR is always kept. */
-    int au_bytes;     /* coded size of the access unit currently arriving */
     int pic_index;    /* the fork's mv_pic_index: non-IDR pictures seen */
     int drop_pic;     /* decision for the picture whose slices are arriving */
     int dropped;      /* pictures withheld, for the verbose line */
 } Decimation;
 
 static int decimating(const Decimation *d) {
-    return d->skip_level > SKIP_NONE || d->skip_nth > 1 || d->decode_nth > 1 ||
-           d->min_bytes > 0;
+    return d->skip_level > SKIP_NONE || d->skip_nth > 1 || d->decode_nth > 1;
 }
 
 /* FFmpeg's skip_frame vocabulary, in AVDiscard order. */
@@ -464,12 +397,6 @@ static int drop_slice(Decimation *d, const uint8_t *nal, const uint8_t *end) {
         drop = (d->skip_nth > 1 && idx % d->skip_nth == 0) ||
                (d->decode_nth > 1 && idx % d->decode_nth != 0);
     }
-    /* Content-adaptive drop: a tiny non-IDR picture is (on a static scene) an
-     * all-skip frame with no motion worth extracting. Safe for the vectors kept
-     * downstream - P-slice mv prediction never reads a dropped picture's motion
-     * field, and the decoder's mv_only path tolerates the missing reference. */
-    if (!drop && d->min_bytes > 0 && !idr && d->au_bytes > 0 && d->au_bytes < d->min_bytes)
-        drop = 1;
     if (!drop) {
         /* slice_type_nos, as FFmpeg tests it: SP counts as P and SI as I. */
         drop = (lvl >= SKIP_BIDIR    && type == 1) ||
@@ -522,7 +449,6 @@ typedef struct {
     Writer *w;
     int frames;      /* pictures decoded; CSV numbering comes from Reorder */
     int packets;     /* video access units demuxed, decoded or not */
-    int keyframes_only;
     int verbose;
     Decimation dm;
     SourceIndex si;
@@ -563,7 +489,6 @@ static void drain(Run *r) {
                 p.poc = dec->FieldOrderCnt[0][pic];
                 p.frame = si_lookup(&r->si, out.FrameId);
                 r->ex.cur = &p;
-                flt_reset(r->ex.flt, mb_w * 16, mb_h * 16);
                 export_picture(&r->ex, mbs, mb_w, mb_h);
                 reorder_push(&r->ro, p, r->w);
             }
@@ -587,13 +512,8 @@ static void feed(Run *r, const uint8_t *buf, size_t len, int64_t pts) {
     while (nal < end0) {
         const uint8_t *end = edge264_find_start_code(nal, end0, 0);
         int nal_type = *nal & 0x1f;
-        /* Keyframes-only drops non-IDR slices (type 1) and keeps parameter
-         * sets, so every surviving picture is a self-contained IDR — the same
-         * frames AVDISCARD_NONKEY leaves the FFmpeg extractors. Decimation
-         * then sees only what that lets through, as libavcodec only ever sees
-         * the packets the demuxer kept. */
-        int keep = !r->keyframes_only || nal_type != 1;
-        if (keep && (nal_type == 1 || nal_type == 5) && decimating(&r->dm))
+        int keep = 1;
+        if ((nal_type == 1 || nal_type == 5) && decimating(&r->dm))
             keep = !drop_slice(&r->dm, nal, end);
         if (keep) {
             /* ENOBUFS means every frame slot is taken; drain() frees one, so
@@ -677,13 +597,6 @@ static int run_demux(Run *r, const char *path) {
 
     while (av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index == vs) {
-            /* Coded size of this access unit, read by drop_slice's
-             * MV_MIN_FRAME_BYTES gate. Taken from the demuxed packet, not the
-             * Annex-B one feed() gets: that is exactly what the custom FFmpeg's
-             * mv_min_frame_bytes measures (avpkt->size), so methods 5 and 8
-             * drop the same pictures. The BSF's start codes and in-band
-             * SPS/PPS would shift it by a byte or so per NAL. */
-            r->dm.au_bytes = pkt->size;
             if (bsfc) {
                 if (av_bsf_send_packet(bsfc, pkt) == 0) {
                     while (av_bsf_receive_packet(bsfc, op) == 0) {
@@ -742,9 +655,9 @@ static int env_int(const char *name, int dflt) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 7) {
+    if (argc < 6) {
         fprintf(stderr, "Usage: %s <input file> <print mv> <output file> "
-                        "<is verbose> <thread_count> <keyframes_only>\n", argv[0]);
+                        "<is verbose> <thread_count>\n", argv[0]);
         return 255;
     }
     const char *in_path = argv[1];
@@ -752,7 +665,6 @@ int main(int argc, char **argv) {
     const char *out_path = argv[3];
     int verbose = atoi(argv[4]);
     int thread_count = atoi(argv[5]);
-    int keyframes_only = atoi(argv[6]) == 1;
 
     /* Deliberately serial. edge264 does have a worker pool (edge264_alloc's
      * first argument), but this extractor reads motion straight out of
@@ -768,19 +680,11 @@ int main(int argc, char **argv) {
     /* Default on, like the fork's mv_l0_only and every other method under the
      * benchmark's L0_ONLY (see BENCH_ENV in the makefile). */
     int l0_only = env_int("L0_ONLY", 1) != 0;
-    int mv_min_size = env_int("MV_MIN_SIZE", 0);
-    int mv_grid = env_int("MV_GRID", 0);
-    if (mv_min_size < 0) mv_min_size = 0;
-    if (mv_min_size > 32767) mv_min_size = 32767;
-    if (mv_grid < 0) mv_grid = 0;
-    if (mv_grid > 32767) mv_grid = 32767;
     Decimation dm = {
         .skip_level = skip_frame_level(getenv("MV_SKIP_FRAME")),
         .skip_nth = env_int("MV_SKIP_EVERY_NTH", 0),
         .decode_nth = env_int("MV_DECODE_EVERY_NTH", 0),
-        .min_bytes = env_int("MV_MIN_FRAME_BYTES", 0),
     };
-    if (dm.min_bytes < 0) dm.min_bytes = 0;
 
     static Writer w;
     if (do_print) {
@@ -802,16 +706,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    MvFilter flt;
-    flt_init(&flt, mv_min_size, mv_grid);
-
-    Run r = { .dec = dec, .keyframes_only = keyframes_only, .verbose = verbose,
+    Run r = { .dec = dec, .verbose = verbose,
               .dm = dm, .last_frame_id = -1 };
     r.si.origin = AV_NOPTS_VALUE;
     memset(r.si.id, 0xff, sizeof r.si.id);   /* -1: no FrameId recorded */
     r.ex.l0_only = l0_only;
     r.ex.collecting = do_print != 0;
-    r.ex.flt = &flt;
     r.w = &w;
 
     double t0 = now_ms();
@@ -846,19 +746,12 @@ int main(int argc, char **argv) {
     if (w.f)
         fclose(w.f);
     edge264_free(&dec);
-    flt_free(&flt);
 
     if (demux_rc != 0) {
         fprintf(stderr, "extractor: could not demux '%s'\n", in_path);
         printf("0 0 %ld 0.000\n", mem);
         return 3;
     }
-    /* Keyframes-only decodes ~2-5%% of the pictures, so reporting decoded
-     * pictures would make ms/frame incomparable with the all-frame methods.
-     * extractor6.rs reports the video packet count for exactly this reason;
-     * match it. CSV rows keep the decoded-picture numbering either way. */
-    int reported = keyframes_only ? r.packets : r.frames;
-
     /* Say why nothing came out. Without this the extractor looks broken: it
      * writes a header-only CSV, reports "0 0", and exits 0. stderr is inherited
      * by the benchmark's children (only stdout is piped - see spawn_processes
@@ -894,6 +787,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "extractor (edge264): pictures=%d packets=%d dropped=%d mvs=%llu serial l0_only=%d\n",
                 r.frames, r.packets, r.dm.dropped, (unsigned long long)r.ex.count, l0_only);
 
-    printf("%d %llu %ld %.3f\n", reported, (unsigned long long)r.ex.count, mem, decode_ms);
+    printf("%d %llu %ld %.3f\n", r.frames, (unsigned long long)r.ex.count, mem, decode_ms);
     return 0;
 }

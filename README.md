@@ -121,18 +121,16 @@ project installs as `extractor8`.
 ```sh
 make extractor                                        # FFmpeg on the default paths
 make extractor FFMPEG_PREFIX=/path/to/ffmpeg-install  # or point it at one
-./extractor in.mp4 1 mvs.csv 0 1 0
+./extractor in.mp4 1 mvs.csv 0 1
 ```
 
 Arguments are positional:
-`<input> <write csv> <output.csv> <verbose> <thread count> <keyframes only>`.
+`<input> <write csv> <output.csv> <verbose> <thread count>`.
 It prints `<frames> <motion vectors> <peak RSS kB> <decode ms>` on stdout, and
 with `<write csv>` non-zero writes
 `frame,source,src_x,src_y,dst_x,dst_y` — one row per inter partition, `dst` the
 partition centre, `src = dst + mv/4`, `source` −1 for list 0 and +1 for list 1.
-Set `L0_ONLY=0` in the environment to keep list-1 rows, `MV_GRID=N` to keep at
-most one vector per NxN pixel cell, `MV_MIN_SIZE=N` to drop vectors shorter than
-N pixels.
+Set `L0_ONLY=0` in the environment to keep list-1 rows.
 
 FFmpeg (libavformat/libavcodec/libavutil) is used **only to demux** containers
 into Annex-B; no pixel decoding happens there. A raw `.264` elementary stream
